@@ -12,3 +12,10 @@ class Status(StrEnum):
     RUNNING = 'running'
     COMPLETE = 'complete'
     FAILED = 'failed'
+
+
+FIELDS = {
+    'duration_frames': '镜头时长（帧）',
+    'grade': '调色方案',
+    'edit_note': '剪辑备注',
+}

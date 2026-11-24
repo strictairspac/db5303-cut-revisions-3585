@@ -6,8 +6,8 @@ from sqlalchemy import and_, or_, select
 
 from src.config.settings import cache, engine
 from src.constants.workflow import Status
-from src.models.tables import audit, cases, evidence, runs
-from src.services import domain
+from src.models.tables import audit, cases, evidence, runs, shot_releases
+from src.services import domain, release_store
 from src.utils.encoding import canonical
 from src.utils.time import utc_time
 
@@ -66,14 +66,14 @@ def claim():
     ready = or_(runs.c.status == Status.QUEUED,
                 and_(runs.c.status == Status.RUNNING, runs.c.started_at < utc_time(-600)))
     with engine.begin() as conn:
-        run = conn.execute(select(runs.c.id, runs.c.case_id).where(ready).order_by(runs.c.id)
+        run = conn.execute(select(runs.c.id, runs.c.case_id, runs.c.owner).where(ready).order_by(runs.c.id)
                            .limit(1).with_for_update(skip_locked=True)).first()
         if not run:
             return None
         token = str(uuid.uuid4())
         conn.execute(runs.update().where(runs.c.id == run.id).values(
             started_at=utc_time(), status=Status.RUNNING, attempt_token=token))
-        return run.id, token, found(conn, cases, run.case_id)['payload']
+        return run.id, token, run.case_id, run.owner, found(conn, cases, run.case_id)['payload']
 
 
 def finish(run_id, token, result=None, error=None):
@@ -86,7 +86,12 @@ def finish(run_id, token, result=None, error=None):
         if not count:
             return
         if result is not None:
-            conn.execute(evidence.insert().values(run_id=run_id, report=result, digest=digest))
+            evidence_id = conn.execute(evidence.insert().values(
+                run_id=run_id, report=result, digest=digest)).inserted_primary_key[0]
+            # Link the durable release to its evidence so the evidence page can
+            # show and revoke exactly this batch.
+            conn.execute(shot_releases.update().where(
+                shot_releases.c.run_id == run_id).values(evidence_id=evidence_id))
         log(conn, 'worker', status.value, run_id)
 
 
@@ -102,3 +107,22 @@ def review(identity, note, actor):
             raise HTTPException(409, '该证据已经复核')
         log(conn, actor, 'review', identity)
         return found(conn, evidence, identity)
+
+
+def history(identity):
+    with engine.connect() as conn:
+        found(conn, evidence, identity)
+    return release_store.evidence_history(engine, identity)
+
+
+def revoke_release(identity, note, actor):
+    note = note.strip()
+    with engine.connect() as conn:
+        found(conn, evidence, identity)
+    try:
+        detail = release_store.revoke(engine, identity, actor, note)
+    except release_store.HistoryMissing as exc:
+        raise HTTPException(409, str(exc)) from None
+    except release_store.RevocationBlocked as exc:
+        raise HTTPException(409, str(exc)) from None
+    return detail

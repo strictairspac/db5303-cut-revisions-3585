@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from .revision_store import Revision, Snapshot, record_review
+from .release_store import Revision, Snapshot, publish_review
 
 
 MAX_DURATION_FRAMES = 86_400
@@ -193,9 +193,11 @@ def validate(payload):
     _plan(payload)
 
 
-def solve(payload, engine):
+def solve(payload, engine, *, case_id=None, run_id=None, actor=None):
     review = _plan(payload)
-    saved, stale = record_review(engine, review.baseline, review.changes, review.stale_attempt)
+    published = publish_review(engine, case_id, actor, review.baseline, review.changes,
+                               review.stale_attempt, run_id=run_id)
+    saved, stale = published.saved, published.stale
     handoff = list(review.handoff)
     evidence = []
     if stale is not None:
@@ -206,23 +208,25 @@ def solve(payload, engine):
             "基线时长（帧）": stale.baseline.values["duration_frames"],
             "补单时长（帧）": stale.proposal["duration_frames"], "胜出时长（帧）": winning.values["duration_frames"],
             "更新行数": stale.updated_rows, "会审数据库进程": stale.editor_pid,
-            "补单数据库进程": stale.submitter_pid, "数据库判定": "过期提交已拦截",
+            "补单数据库进程": stale.submitter_pid,
+            "数据库判定": stale.note if not stale.blocked else "过期提交已拦截",
         })
-        handoff.append({
-            "镜头号": shot_id, "事项": "过期提交", "字段": FIELDS["duration_frames"],
-            "提案基线版次": stale.baseline.version, "基线值": stale.baseline.values["duration_frames"],
-            "当前版次": winning.version,
-            "当前值": winning.values["duration_frames"], "提交方甲": "迟交补单人",
-            "提案甲": stale.proposal["duration_frames"], "提交方乙": "会审已发布版", "提案乙": winning.values["duration_frames"],
-            "接手人": "会审制片", "后续动作": "以当前版次复核补单时长，经相关组确认后重新提交",
-        })
+        if stale.blocked:
+            handoff.append({
+                "镜头号": shot_id, "事项": "过期提交", "字段": FIELDS["duration_frames"],
+                "提案基线版次": stale.baseline.version, "基线值": stale.baseline.values["duration_frames"],
+                "当前版次": winning.version,
+                "当前值": winning.values["duration_frames"], "提交方甲": "迟交补单人",
+                "提案甲": stale.proposal["duration_frames"], "提交方乙": "会审已发布版", "提案乙": winning.values["duration_frames"],
+                "接手人": "会审制片", "后续动作": "以当前版次复核补单时长，经相关组确认后重新提交",
+            })
 
     shot_rows = []
     for shot_id, baseline in review.baseline.items():
         current = saved[shot_id]
         if shot_id in review.blocked:
             status = "待会审"
-        elif current.version > baseline.version:
+        elif shot_id in published.applied:
             status = "已发布"
         else:
             status = "沿用原版"
@@ -230,19 +234,21 @@ def solve(payload, engine):
             "镜头号": shot_id, "基线版次": baseline.version, "当前版次": current.version, "发布状态": status,
             **{label: current.values[key] for key, label in FIELDS.items()},
         })
-    published = sum(row["发布状态"] == "已发布" for row in shot_rows)
+    published_count = sum(row["发布状态"] == "已发布" for row in shot_rows)
     blocked = len(review.blocked)
-    stale_rejected = len(evidence)
+    stale_rejected = sum(1 for row in evidence if row["数据库判定"] == "过期提交已拦截")
     return {
-        "summary": f"已发布 {published} 条镜头，{blocked} 条镜头待会审，数据库拦截 {stale_rejected} 次过期提交。",
+        "release_id": published.release_id,
+        "summary": f"已发布 {published_count} 条镜头，{blocked} 条镜头待会审，数据库拦截 {stale_rejected} 次过期提交。",
         "metrics": {
-            "已发布镜头": published, "待会审镜头": blocked, "分歧字段": len(review.handoff),
-            "沿用原版镜头": len(shot_rows) - published - blocked,
+            "已发布镜头": published_count, "待会审镜头": blocked, "分歧字段": len(review.handoff),
+            "沿用原版镜头": len(shot_rows) - published_count - blocked,
             "过期提交拦截": stale_rejected, "交接事项": len(handoff),
         },
         "sections": [
             {"title": "镜头当前版次", "rows": shot_rows},
             {"title": "三方逐字段比对", "rows": review.comparisons},
+            {"title": "本次发布的字段履历", "rows": published.history},
             {"title": "PostgreSQL 条件更新凭据", "rows": evidence},
             {"title": "冲突交接单", "rows": handoff},
         ],

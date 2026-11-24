@@ -4,7 +4,7 @@ from sqlalchemy import text
 from src.config.settings import cache, engine
 from src.controllers.workflow import download
 from src.models.tables import audit, cases, evidence, runs
-from src.schemas.workflow import CaseForm, LoginForm, ReviewForm
+from src.schemas.workflow import CaseForm, LoginForm, ReviewForm, RevokeForm
 from src.services import domain, workflow
 from src.services.security import current_user, login, operator, reviewer
 
@@ -59,9 +59,19 @@ def export_evidence(identity: int, _=Depends(current_user)):
     return download(identity)
 
 
+@router.get('/evidence/{identity}/history')
+def evidence_history(identity: int, _=Depends(current_user)):
+    return workflow.history(identity)
+
+
 @router.post('/evidence/{identity}/review')
 def review_evidence(identity: int, form: ReviewForm, actor=Depends(reviewer)):
     return workflow.review(identity, form.note, actor)
+
+
+@router.post('/evidence/{identity}/revoke')
+def revoke_evidence(identity: int, form: RevokeForm, actor=Depends(reviewer)):
+    return workflow.revoke_release(identity, form.note, actor)
 
 
 @router.get('/audit')
